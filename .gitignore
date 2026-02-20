@@ -6,3 +6,4 @@ rollouts/
 experiments/
 *__pycache__*
 maniskill_vla.sif
+.env
