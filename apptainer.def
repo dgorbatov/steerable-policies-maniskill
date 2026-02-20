@@ -1,0 +1,106 @@
+# apptainer.def
+#
+# Builds an Apptainer SIF image for evaluating the steerable-policy VLA
+# inside ManiSkill 3 bridge dataset digital-twin environments.
+#
+# Prerequisites:
+#   1. Pull the ManiSkill Docker image and convert it to a local SIF:
+#        docker pull haosulab/mani-skill
+#        apptainer build maniskill_base.sif docker://haosulab/mani-skill
+#   2. Update the "From:" path below to point at that SIF.
+#
+# Build:
+#   apptainer build maniskill_vla.sif apptainer.def
+#
+# Run (bind-mount repo + weights, no baked-in code):
+#   apptainer run --nv \
+#       --bind /mmfs1/gscratch/weirdlab/dg20/steerable-policies-maniskill:/workspace \
+#       --bind /path/to/model/weights:/weights \
+#       maniskill_vla.sif \
+#       python /workspace/robot/maniskill/run_maniskill_eval.py \
+#           --model_family prismatic \
+#           --pretrained_checkpoint /weights/my-checkpoint \
+#           --tasks PutCarrotOnPlateInScene-v1 \
+#           --num_trials_per_task 50
+#
+# Asset download (run once inside the container before evaluating):
+#   apptainer exec --nv maniskill_vla.sif \
+#       python -m mani_skill.utils.download_asset bridge_v2_real2sim
+
+Bootstrap: localimage
+From: /mmfs1/gscratch/weirdlab/dg20/maniskill_base.sif
+
+%post
+    set -e
+
+    # Upgrade pip to avoid build issues
+    pip install --upgrade pip
+
+    # ------------------------------------------------------------------
+    # PyTorch 2.2.0 with CUDA 12.1 wheels
+    # Cluster drivers expose CUDA 12.x to Apptainer containers via --nv,
+    # so cu121 wheels work even on a CUDA 12.x host.
+    # ------------------------------------------------------------------
+    pip install \
+        torch==2.2.0 \
+        torchvision==0.17.0 \
+        torchaudio==2.2.0 \
+        --index-url https://download.pytorch.org/whl/cu121
+
+    # ------------------------------------------------------------------
+    # VLA inference dependencies (eval-only; no flash-attn required)
+    # ------------------------------------------------------------------
+    pip install \
+        accelerate>=0.25.0 \
+        draccus==0.8.0 \
+        einops \
+        huggingface_hub \
+        json-numpy \
+        jsonlines \
+        matplotlib \
+        peft==0.11.1 \
+        protobuf \
+        rich \
+        sentencepiece==0.1.99 \
+        timm==0.9.10 \
+        tokenizers==0.19.1 \
+        transformers==4.40.1 \
+        wandb \
+        imageio \
+        imageio-ffmpeg \
+        opencv-python-headless
+
+    # ------------------------------------------------------------------
+    # TensorFlow 2.15 – used for bridge-dataset-compatible image
+    # preprocessing (JPEG encode/decode + lanczos resize).
+    # ------------------------------------------------------------------
+    pip install \
+        tensorflow==2.15.0 \
+        tensorflow_datasets==4.9.3
+
+    # ------------------------------------------------------------------
+    # Prismatic / OpenVLA data-loading dependency
+    # ------------------------------------------------------------------
+    pip install "dlimp @ git+https://github.com/moojink/dlimp_openvla"
+
+    # Rotation utilities
+    pip install transforms3d
+
+%environment
+    # Bind-mounted steerable-policies repo is expected at /workspace at runtime
+    export PYTHONPATH=/workspace:${PYTHONPATH}
+
+    # Suppress TF GPU messages – ManiSkill uses SAPIEN/PhysX for GPU, not TF
+    export TF_CPP_MIN_LOG_LEVEL=3
+
+    # Prevent TF from allocating all GPU memory (leaves room for PyTorch)
+    export TF_FORCE_GPU_ALLOW_GROWTH=true
+
+    # Use headless rendering (no display needed for off-screen sim)
+    export DISPLAY=
+
+%labels
+    Maintainer  "dg20"
+    Purpose     "ManiSkill 3 bridge env + Steerable Policy VLA evaluation"
+    PyTorch     "2.2.0+cu121"
+    TensorFlow  "2.15.0"
