@@ -8,7 +8,7 @@ import time
 import numpy as np
 import torch
 
-from experiments.robot.openvla_utils import (
+from robot.openvla_utils import (
     get_prismatic_vla,
     get_prismatic_vla_action,
     get_vla,

@@ -1,2 +1,8 @@
 .cache
 .claude
+.envrollouts/
+experiments/logs/
+rollouts/
+experiments/
+*__pycache__*
+maniskill_vla.sif

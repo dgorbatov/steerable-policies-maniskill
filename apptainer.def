@@ -73,10 +73,12 @@ From: /mmfs1/gscratch/weirdlab/dg20/maniskill_base.sif
     # ------------------------------------------------------------------
     # TensorFlow 2.15 – used for bridge-dataset-compatible image
     # preprocessing (JPEG encode/decode + lanczos resize).
+    # tensorflow_graphics is required by prismatic/vla dataset code at import time.
     # ------------------------------------------------------------------
     pip install \
         tensorflow==2.15.0 \
-        tensorflow_datasets==4.9.3
+        tensorflow_datasets==4.9.3 \
+        tensorflow_graphics==2021.12.3
 
     # ------------------------------------------------------------------
     # Prismatic / OpenVLA data-loading dependency
