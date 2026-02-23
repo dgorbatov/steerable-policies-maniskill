@@ -32,9 +32,9 @@ apptainer run --nv \
     --env TORCH_HOME=/workspace/.cache/torch \
     --env MS_ASSET_DIR=/root/.maniskill \
     --env HF_TOKEN="${HF_TOKEN:-}" \
+    --env GEMINI_API_KEY="${GEMINI_API_KEY:-}" \
     $REPO/maniskill_vla.sif \
     python /workspace/robot/maniskill/run_maniskill_eval.py \
         --pretrained_checkpoint "$CHECKPOINT" \
-        --tasks "PutCarrotOnPlateInScene-v1,PutEggplantInBasketScene-v1,StackGreenCubeOnYellowCubeBakedTexInScene-v1,PutSpoonOnTableClothInScene-v1" \
-        --num_trials_per_task 2 \
-        --interactive True
+        --tasks "PutEggplantInBasketScene-v1,StackGreenCubeOnYellowCubeBakedTexInScene-v1,PutSpoonOnTableClothInScene-v1" \
+        --prompt_every_n_steps 20

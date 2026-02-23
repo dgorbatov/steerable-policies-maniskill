@@ -69,7 +69,7 @@ from robot.robot_utils import (
 _CONTROL_MODE = "arm_pd_ee_target_delta_pose_align2_gripper_pd_joint_pos"
 _OBS_MODE = "rgb+segmentation"
 # Bridge data is 5 Hz; 150 steps = 30 seconds of interaction
-_MAX_STEPS = 150
+_MAX_STEPS = 300
 
 
 @dataclass
@@ -122,6 +122,21 @@ class GenerateConfig:
     video_fps: int = 5                              # Match sim control freq (5 Hz)
 
     interactive: bool = False                       # On failure: show video path, prompt for a new instruction, and retry same seed
+    prompt_every_n_steps: int = 0                   # Pause every N steps, save partial video, and prompt for a new instruction (0 = off, non-Gemini only)
+
+    ###########################################################################
+    # Gemini high-level policy (Section V-B of the Steerable Policies paper)
+    ###########################################################################
+    use_gemini: bool = False                        # Enable Gemini as the high-level policy
+    # Prompt mode — mirrors the three experimental conditions in the paper:
+    #   "full"         → full reasoning + all steering abstractions (Fig. 22)
+    #   "no_reasoning" → single-line output, all abstractions       (Fig. 23)
+    #   "saycan"       → subtask-level commands only                (Fig. 24)
+    gemini_mode: str = "full"
+    gemini_model: str = "gemini-2.5-flash"          # Gemini model name
+    gemini_api_key_env: str = "GEMINI_API_KEY"      # Name of env var holding Gemini API key
+    gemini_steps: int = 20                          # Env steps between Gemini queries (paper: 20)
+    gemini_max_history: int = 10                    # Max within-episode history entries
 
     seed: int = 7                                   # Global random seed
 
@@ -133,6 +148,13 @@ def eval_maniskill(cfg: GenerateConfig) -> None:
     assert cfg.pretrained_checkpoint, "cfg.pretrained_checkpoint must not be empty!"
     assert not (cfg.load_in_8bit and cfg.load_in_4bit), "Cannot use both 8-bit and 4-bit quantization!"
     assert not cfg.use_wrist_image, "use_wrist_image is not supported for ManiSkill 3 eval."
+    assert not (cfg.use_gemini and cfg.interactive), (
+        "--use_gemini and --interactive are mutually exclusive. "
+        "In Gemini mode the policy automatically retries failed seeds without user input."
+    )
+    assert not (cfg.use_gemini and cfg.prompt_every_n_steps > 0), (
+        "--use_gemini and --prompt_every_n_steps are mutually exclusive."
+    )
 
     # ------------------------------------------------------------------
     # Seed
@@ -173,6 +195,43 @@ def eval_maniskill(cfg: GenerateConfig) -> None:
         wandb.init(entity=cfg.wandb_entity, project=cfg.wandb_project, name=run_id)
 
     # ------------------------------------------------------------------
+    # Gemini API key validation (fail early if key is missing)
+    # ------------------------------------------------------------------
+    gemini_api_key = None
+    if cfg.use_gemini:
+        gemini_api_key = os.environ.get(cfg.gemini_api_key_env)
+        if not gemini_api_key:
+            raise ValueError(
+                f"Gemini API key not found. Set the '{cfg.gemini_api_key_env}' "
+                f"environment variable before running with --use_gemini."
+            )
+        # Validate mode early
+        from robot.maniskill.gemini_highlevel import GeminiHighLevelPolicy
+        assert cfg.gemini_mode in GeminiHighLevelPolicy.MODES, (
+            f"--gemini_mode must be one of {GeminiHighLevelPolicy.MODES}"
+        )
+        print(f"[Gemini] High-level policy enabled (mode={cfg.gemini_mode}, "
+              f"model={cfg.gemini_model}, steps_per_query={cfg.gemini_steps})")
+
+    # ------------------------------------------------------------------
+    # Keypoint resolver (for <tag> → [x, y] in manual prompt paths)
+    # ------------------------------------------------------------------
+    keypoint_resolver = None
+    if cfg.interactive or cfg.prompt_every_n_steps > 0:
+        _kp_api_key = os.environ.get(cfg.gemini_api_key_env)
+        if _kp_api_key:
+            from robot.maniskill.gemini_highlevel import KeypointResolver
+            keypoint_resolver = KeypointResolver(
+                model_name=cfg.gemini_model,
+                api_key=_kp_api_key,
+                img_width=640,
+                img_height=480,
+            )
+            print(f"[Keypoint] Resolver enabled — <tag> placeholders will be resolved via Gemini")
+        else:
+            print(f"[Keypoint] No {cfg.gemini_api_key_env} found; <tag> resolution disabled.")
+
+    # ------------------------------------------------------------------
     # Image resize size
     # ------------------------------------------------------------------
     resize_size = get_image_resize_size(cfg)
@@ -194,6 +253,21 @@ def eval_maniskill(cfg: GenerateConfig) -> None:
         print(f"Instruction: \"{task_description}\"")
         print(f"{'='*60}")
         log_file.write(f"\nTask: {task_name}\nInstruction: {task_description}\n")
+
+        # Create Gemini high-level policy for this task (if enabled)
+        gemini_policy = None
+        if cfg.use_gemini:
+            from robot.maniskill.gemini_highlevel import GeminiHighLevelPolicy
+            gemini_policy = GeminiHighLevelPolicy(
+                task_description=task_description,
+                mode=cfg.gemini_mode,
+                model_name=cfg.gemini_model,
+                api_key=gemini_api_key,
+                steps_per_query=cfg.gemini_steps,
+                max_history=cfg.gemini_max_history,
+                img_width=640,
+                img_height=480,
+            )
 
         # Create ManiSkill 3 environment
         env = gym.make(
@@ -220,27 +294,69 @@ def eval_maniskill(cfg: GenerateConfig) -> None:
                 log_file.write(f"Episode {trial_idx + 1}: seed={seed} attempt={attempt} "
                                f"prompt=\"{current_instruction}\"\n")
 
+                # Reset Gemini episode state (clears within-episode history)
+                if gemini_policy is not None:
+                    gemini_policy.reset()
+
                 obs, _ = env.reset(seed=seed)
 
                 t = 0
                 replay_images = []
                 fullres_frames = []
                 success = False
+                _task_tag = task_name.replace("-", "_").replace(" ", "_")[:40]
+                rollout_dir = f"./rollouts/{DATE_TIME}"
+                os.makedirs(rollout_dir, exist_ok=True)
 
                 for _ in range(cfg.num_steps_wait):
                     obs, _, _, _, _ = env.step(np.zeros(7))
 
                 while t < _MAX_STEPS:
-                    # ---------- Capture full-res frame ----------
-                    if cfg.save_video:
-                        raw = obs["sensor_data"]["3rd_view_camera"]["rgb"]
-                        if hasattr(raw, "shape") and len(raw.shape) == 4:
-                            raw = raw[0]
-                        if hasattr(raw, "cpu"):
-                            raw = raw.cpu().numpy()
-                        elif hasattr(raw, "numpy"):
-                            raw = raw.numpy()
-                        fullres_frames.append(np.asarray(raw, dtype=np.uint8))
+                    # ---------- Capture full-res frame (needed for Gemini / video / mid-episode prompt) ----------
+                    raw_rgb = obs["sensor_data"]["3rd_view_camera"]["rgb"]
+                    if hasattr(raw_rgb, "shape") and len(raw_rgb.shape) == 4:
+                        raw_rgb = raw_rgb[0]
+                    if hasattr(raw_rgb, "cpu"):
+                        raw_rgb = raw_rgb.cpu().numpy()
+                    elif hasattr(raw_rgb, "numpy"):
+                        raw_rgb = raw_rgb.numpy()
+                    raw_rgb = np.asarray(raw_rgb, dtype=np.uint8)
+
+                    if cfg.save_video or cfg.prompt_every_n_steps > 0:
+                        fullres_frames.append(raw_rgb)
+
+                    # ---------- Mid-episode interactive prompt (non-Gemini) ----------
+                    if cfg.prompt_every_n_steps > 0 and t > 0 and t % cfg.prompt_every_n_steps == 0:
+                        partial_path = (
+                            f"{rollout_dir}/ep{total_episodes + 1:04d}"
+                            f"--attempt{attempt}"
+                            f"--step{t:03d}"
+                            f"--{_task_tag}_partial.mp4"
+                        )
+                        writer = imageio.get_writer(partial_path, fps=cfg.video_fps)
+                        for frame in fullres_frames:
+                            writer.append_data(frame)
+                        writer.close()
+                        print(f"\n{'─'*60}")
+                        print(f"  Step {t}/{_MAX_STEPS}  |  Task: \"{task_description}\"")
+                        print(f"  Current instruction: \"{current_instruction}\"")
+                        print(f"  Partial video saved: {partial_path}")
+                        try:
+                            new_prompt = input("  New instruction (Enter to keep current): ").strip()
+                        except EOFError:
+                            new_prompt = ""
+                        if new_prompt:
+                            if "<" in new_prompt and keypoint_resolver is not None:
+                                new_prompt = keypoint_resolver.resolve(new_prompt, raw_rgb)
+                                print(f"  Resolved: \"{new_prompt}\"")
+                            current_instruction = new_prompt
+                            log_file.write(f"  Step {t}: instruction → \"{new_prompt}\"\n")
+                            print(f"  Instruction updated: \"{new_prompt}\"")
+                        print(f"{'─'*60}")
+
+                    # ---------- Gemini high-level policy: update steering command ----------
+                    if gemini_policy is not None:
+                        current_instruction = gemini_policy.step(raw_rgb)
 
                     # ---------- Preprocess image ----------
                     img = get_maniskill_img(obs, resize_size)
@@ -295,14 +411,12 @@ def eval_maniskill(cfg: GenerateConfig) -> None:
                     if _term or _trunc:
                         break
 
-                print(f"  Success: {success}  |  Steps: {t}  |  Prompt: \"{current_instruction}\"")
+                final_instruction = current_instruction if gemini_policy is None else "(gemini)"
+                print(f"  Success: {success}  |  Steps: {t}  |  Prompt: \"{final_instruction}\"")
                 log_file.write(f"  Success: {success}  Steps: {t}\n")
 
                 # Save video for this attempt
                 if cfg.save_video and fullres_frames:
-                    _task_tag = task_name.replace("-", "_").replace(" ", "_")[:40]
-                    rollout_dir = f"./rollouts/{DATE_TIME}"
-                    os.makedirs(rollout_dir, exist_ok=True)
                     vid_path = (
                         f"{rollout_dir}/ep{total_episodes + 1:04d}"
                         f"--attempt{attempt}"
@@ -316,7 +430,20 @@ def eval_maniskill(cfg: GenerateConfig) -> None:
                     print(f"  Video: {vid_path}")
                     log_file.write(f"  Video: {vid_path}\n")
 
-                # Interactive retry on failure
+                # Save Gemini trace for this attempt
+                if gemini_policy is not None:
+                    trace_path = (
+                        f"{rollout_dir}/ep{total_episodes + 1:04d}"
+                        f"--attempt{attempt}"
+                        f"--success={success}"
+                        f"--{_task_tag}_trace.txt"
+                    )
+                    with open(trace_path, "w") as tf:
+                        tf.write(gemini_policy.format_trace(task_name, seed, attempt, success, t))
+                    print(f"  Gemini trace: {trace_path}")
+                    log_file.write(f"  Gemini trace: {trace_path}\n")
+
+                # Interactive mode: prompt user for a new instruction, then retry
                 if not success and cfg.interactive:
                     print(f"\n{'─'*60}")
                     print(f"  FAILED. Review the video above, then enter a new prompt to")
@@ -328,6 +455,9 @@ def eval_maniskill(cfg: GenerateConfig) -> None:
                         new_prompt = ""
                     print(f"{'─'*60}")
                     if new_prompt:
+                        if "<" in new_prompt and keypoint_resolver is not None:
+                            new_prompt = keypoint_resolver.resolve(new_prompt, raw_rgb)
+                            print(f"  Resolved: \"{new_prompt}\"")
                         log_file.write(f"  >> Retrying with prompt: \"{new_prompt}\"\n")
                         current_instruction = new_prompt
                         continue  # retry same seed
